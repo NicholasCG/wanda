@@ -1,0 +1,21 @@
+.git
+.gitignore
+
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local outputs and caches
+results/
+out/
+.cache/
+
+# Large local model caches
+llm_weights/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
