@@ -23,12 +23,26 @@ print('# of gpus: ', torch.cuda.device_count())
 
 
 def get_llm(model_name, cache_dir='llm_weights'):
+    # Reserve 2 GiB headroom on the GPU to prevent accelerate from disk-offloading
+    # layers when allocator fragmentation builds up across repeated model loads.
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 0:
+        total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
+        reserved_bytes = 2 * (1024 ** 3)  # 2 GiB headroom
+        usable_bytes = max(total_gpu_mem - reserved_bytes, reserved_bytes)
+        usable_gib = f"{usable_bytes // (1024 ** 3)}GiB"
+        max_memory = {i: usable_gib for i in range(n_gpus)}
+        max_memory['cpu'] = '48GiB'
+    else:
+        max_memory = None
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
         cache_dir=cache_dir,
         low_cpu_mem_usage=True,
         device_map='auto',
+        max_memory=max_memory,
     )
     model.seqlen = model.config.max_position_embeddings
     return model
@@ -96,15 +110,11 @@ def maybe_move_tensor(x, dev):
     return x.to(dev)
 
 
-def move_calib_to_layer_device(model, layer_idx, inps, outs, attention_mask, position_ids):
+def get_layer_device(model, layer_idx):
     dev = torch.device('cuda:0')
     if hasattr(model, 'hf_device_map') and f'model.layers.{layer_idx}' in model.hf_device_map:
         dev = model.hf_device_map[f'model.layers.{layer_idx}']
-    inps = inps.to(dev)
-    outs = outs.to(dev)
-    attention_mask = maybe_move_tensor(attention_mask, dev)
-    position_ids = maybe_move_tensor(position_ids, dev)
-    return dev, inps, outs, attention_mask, position_ids
+    return dev
 
 
 def get_layer_inputs(model, tokenizer, args, device, target_layer_idx):
@@ -130,29 +140,151 @@ def get_layer_inputs(model, tokenizer, args, device, target_layer_idx):
                     model, dataloader, device
                 )
 
+        # Keep full activation buffers on CPU and stream per-sample to GPU.
+        inps = inps.to('cpu')
+        outs = outs.to('cpu')
+        attention_mask = maybe_move_tensor(attention_mask, 'cpu')
+        position_ids = maybe_move_tensor(position_ids, 'cpu')
+
         layers = model.model.layers
         for i in range(target_layer_idx):
-            dev_i, inps, outs, attention_mask, position_ids = move_calib_to_layer_device(
-                model, i, inps, outs, attention_mask, position_ids
-            )
+            dev_i = get_layer_device(model, i)
+            attention_mask_i = maybe_move_tensor(attention_mask, dev_i)
+            position_ids_i = maybe_move_tensor(position_ids, dev_i)
             layer = layers[i]
             for j in range(args.nsamples):
                 with torch.no_grad():
-                    outs[j] = layer(
-                        inps[j].unsqueeze(0),
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
+                    inp_j = inps[j].unsqueeze(0).to(dev_i)
+                    out_j = layer(
+                        inp_j,
+                        attention_mask=attention_mask_i,
+                        position_ids=position_ids_i,
                     )[0]
+                    outs[j] = out_j.squeeze(0).to('cpu')
             inps, outs = outs, inps
+            del attention_mask_i, position_ids_i
             if isinstance(dev_i, str) or (hasattr(dev_i, 'type') and str(dev_i).startswith('cuda')):
                 torch.cuda.empty_cache()
 
-        dev_t, inps, outs, attention_mask, position_ids = move_calib_to_layer_device(
-            model, target_layer_idx, inps, outs, attention_mask, position_ids
-        )
+        dev_t = get_layer_device(model, target_layer_idx)
         return dev_t, inps, outs, attention_mask, position_ids
     finally:
         model.config.use_cache = use_cache
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: one-time calibration cache
+# ---------------------------------------------------------------------------
+
+def _calib_cache_complete(cache_dir, num_layers):
+    """Return True only if every per-layer input file and the meta file exist."""
+    if not os.path.isdir(cache_dir):
+        return False
+    if not os.path.exists(os.path.join(cache_dir, 'calib_meta.pt')):
+        return False
+    for i in range(num_layers):
+        if not os.path.exists(os.path.join(cache_dir, f'layer_{i:04d}_inps.pt')):
+            return False
+    return True
+
+
+def build_layer_input_cache(model, tokenizer, args, device, cache_dir):
+    """Single O(N) forward sweep that saves calibration inputs for every layer.
+
+    Replaces the repeated O(i) re-propagation that made prune_time_s grow
+    linearly with layer index.  After this runs once, each layer evaluation
+    just loads its pre-computed input slice from disk.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    try:
+        dataloader, _ = get_loaders(
+            'c4',
+            nsamples=args.nsamples,
+            seed=args.seed,
+            seqlen=model.seqlen,
+            tokenizer=tokenizer,
+        )
+        with torch.no_grad():
+            sig = inspect.signature(prepare_calibration_input)
+            if len(sig.parameters) >= 4:
+                inps, outs, attention_mask, position_ids = prepare_calibration_input(
+                    model, dataloader, device, args.nsamples
+                )
+            else:
+                inps, outs, attention_mask, position_ids = prepare_calibration_input(
+                    model, dataloader, device
+                )
+
+        inps = inps.to('cpu')
+        outs = outs.to('cpu')
+        attention_mask = maybe_move_tensor(attention_mask, 'cpu')
+        position_ids = maybe_move_tensor(position_ids, 'cpu')
+
+        # Persist attention_mask / position_ids once; they are the same for
+        # every layer since positional encoding is fixed per sequence.
+        torch.save(
+            {'attention_mask': attention_mask, 'position_ids': position_ids},
+            os.path.join(cache_dir, 'calib_meta.pt'),
+        )
+
+        layers = model.model.layers
+        for i in range(len(layers)):
+            # Save *before* propagating so file i holds inputs *to* layer i.
+            torch.save(inps, os.path.join(cache_dir, f'layer_{i:04d}_inps.pt'))
+            print(f'  cached layer {i} inputs')
+
+            dev_i = get_layer_device(model, i)
+            attention_mask_i = maybe_move_tensor(attention_mask, dev_i)
+            position_ids_i = maybe_move_tensor(position_ids, dev_i)
+            layer = layers[i]
+            for j in range(args.nsamples):
+                with torch.no_grad():
+                    inp_j = inps[j].unsqueeze(0).to(dev_i)
+                    out_j = layer(
+                        inp_j,
+                        attention_mask=attention_mask_i,
+                        position_ids=position_ids_i,
+                    )[0]
+                    outs[j] = out_j.squeeze(0).to('cpu')
+            inps, outs = outs, inps
+            del attention_mask_i, position_ids_i
+            torch.cuda.empty_cache()
+    finally:
+        model.config.use_cache = use_cache
+
+
+def load_layer_inputs(cache_dir, layer_idx):
+    """Load pre-computed calibration inputs for *layer_idx* from the cache."""
+    inps = torch.load(os.path.join(cache_dir, f'layer_{layer_idx:04d}_inps.pt'))
+    outs = torch.zeros_like(inps)  # write buffer; overwritten during forward pass
+    meta = torch.load(os.path.join(cache_dir, 'calib_meta.pt'))
+    return inps, outs, meta['attention_mask'], meta['position_ids']
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2: per-layer weight snapshot / restore
+# ---------------------------------------------------------------------------
+
+def snapshot_layer_weights(model, layer_idx):
+    """Clone every parameter in the target transformer block."""
+    layer = model.model.layers[layer_idx]
+    return {name: param.data.clone() for name, param in layer.named_parameters()
+            if param.device.type != 'meta'}
+
+
+def restore_layer_weights(model, layer_idx, snapshot):
+    """Copy the snapshot tensors back into the target transformer block."""
+    layer = model.model.layers[layer_idx]
+    for name, original_data in snapshot.items():
+        parts = name.split('.')
+        mod = layer
+        for p in parts[:-1]:
+            mod = getattr(mod, p)
+        param = getattr(mod, parts[-1])
+        if hasattr(param, 'data') and param.device.type != 'meta':
+            param.data.copy_(original_data)
 
 
 def move_wrapped_layer_state_to_device(wrapped_layers, subset):
@@ -192,24 +324,38 @@ def prune_single_layer_magnitude(model, target_layer_idx, sparsity_ratio, prune_
 
 
 @torch.no_grad()
-def prune_single_layer_wanda(model, tokenizer, args, device, target_layer_idx, prune_n=0, prune_m=0):
+def prune_single_layer_wanda(model, tokenizer, args, device, target_layer_idx, prune_n=0, prune_m=0, precomputed_inputs=None):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     handles = []
     try:
-        print('loading calibration data')
-        dev, inps, outs, attention_mask, position_ids = get_layer_inputs(
-            model, tokenizer, args, device, target_layer_idx
-        )
-        print('dataset loading complete')
+        if precomputed_inputs is not None:
+            inps, outs, attention_mask, position_ids = precomputed_inputs
+            dev = get_layer_device(model, target_layer_idx)
+        else:
+            print('loading calibration data')
+            dev, inps, outs, attention_mask, position_ids = get_layer_inputs(
+                model, tokenizer, args, device, target_layer_idx
+            )
+            print('dataset loading complete')
 
         layer = model.model.layers[target_layer_idx]
         subset = find_layers(layer)
         wrapped_layers = {name: WrappedGPT(subset[name]) for name in subset}
         move_wrapped_layer_state_to_device(wrapped_layers, subset)
+        attention_mask_dev = maybe_move_tensor(attention_mask, dev)
+        position_ids_dev = maybe_move_tensor(position_ids, dev)
+
+        # Capture each sub-layer's weight while it is guaranteed to be
+        # materialized on the execution device (pre_forward has loaded it).
+        # This guards against accelerate's AlignDevicesHook returning the
+        # weight to a meta tensor after post_forward when disk-offloading.
+        captured_weights = {}
 
         def add_batch(name):
             def tmp(_, inp, out):
+                if name not in captured_weights and subset[name].weight.device.type != 'meta':
+                    captured_weights[name] = subset[name].weight.data.detach().clone()
                 if hasattr(wrapped_layers[name], 'scaler_row'):
                     if wrapped_layers[name].scaler_row.device != inp[0].device:
                         if wrapped_layers[name].scaler_row.device.type == 'meta':
@@ -228,11 +374,13 @@ def prune_single_layer_wanda(model, tokenizer, args, device, target_layer_idx, p
 
         for j in range(args.nsamples):
             with torch.no_grad():
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+                inp_j = inps[j].unsqueeze(0).to(dev)
+                out_j = layer(
+                    inp_j,
+                    attention_mask=attention_mask_dev,
+                    position_ids=position_ids_dev,
                 )[0]
+                outs[j] = out_j.squeeze(0).to('cpu')
 
         for h in handles:
             h.remove()
@@ -240,12 +388,15 @@ def prune_single_layer_wanda(model, tokenizer, args, device, target_layer_idx, p
 
         for name in subset:
             print(f'pruning layer {target_layer_idx} name {name}')
-            if wrapped_layers[name].scaler_row.device != subset[name].weight.device:
-                wrapped_layers[name].scaler_row = wrapped_layers[name].scaler_row.to(subset[name].weight.device)
+            # Use the weight captured during the forward pass; fall back to
+            # the live parameter only if capture succeeded (non-meta).
+            W = captured_weights.get(name, subset[name].weight.data)
+            W_dev = W.device
+            scaler = wrapped_layers[name].scaler_row
+            if scaler.device != W_dev:
+                scaler = scaler.to(W_dev)
 
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(
-                wrapped_layers[name].scaler_row.reshape((1, -1))
-            )
+            W_metric = torch.abs(W) * torch.sqrt(scaler.reshape((1, -1)))
             W_mask = torch.zeros_like(W_metric, dtype=torch.bool)
 
             if prune_n != 0:
@@ -254,8 +405,8 @@ def prune_single_layer_wanda(model, tokenizer, args, device, target_layer_idx, p
                         tmp = W_metric[:, ii:(ii + prune_m)].float()
                         W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
             else:
-                sort_res = torch.sort(W_metric, dim=-1, stable=True)
                 if args.use_variant:
+                    sort_res = torch.sort(W_metric, dim=-1, stable=True)
                     tmp_metric = torch.cumsum(sort_res[0], dim=1)
                     sum_before = W_metric.sum(dim=1)
                     alpha = 0.4
@@ -272,9 +423,22 @@ def prune_single_layer_wanda(model, tokenizer, args, device, target_layer_idx, p
                         W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
                     print(f'alpha found {alpha} sparsity {cur_sparsity:.6f}')
                 else:
-                    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity_ratio)]
+                    indices = torch.topk(
+                        W_metric,
+                        int(W_metric.shape[1] * args.sparsity_ratio),
+                        dim=1,
+                        largest=False,
+                    )[1]
                     W_mask.scatter_(1, indices, True)
-            subset[name].weight.data[W_mask] = 0
+            # Apply mask: write zeros into the live weight parameter.
+            # If the layer is disk-offloaded the weight may be meta here, so
+            # we write through the captured copy and replace the parameter data.
+            if subset[name].weight.device.type == 'meta':
+                W_zeroed = W.clone()
+                W_zeroed[W_mask] = 0
+                subset[name].weight = torch.nn.Parameter(W_zeroed, requires_grad=False)
+            else:
+                subset[name].weight.data[W_mask] = 0
     finally:
         for h in handles:
             try:
@@ -286,20 +450,26 @@ def prune_single_layer_wanda(model, tokenizer, args, device, target_layer_idx, p
 
 
 @torch.no_grad()
-def prune_single_layer_sparsegpt(model, tokenizer, args, device, target_layer_idx, prune_n=0, prune_m=0):
+def prune_single_layer_sparsegpt(model, tokenizer, args, device, target_layer_idx, prune_n=0, prune_m=0, precomputed_inputs=None):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     handles = []
     try:
-        print('Starting ...')
-        dev, inps, outs, attention_mask, position_ids = get_layer_inputs(
-            model, tokenizer, args, device, target_layer_idx
-        )
-        print('Ready.')
+        if precomputed_inputs is not None:
+            inps, outs, attention_mask, position_ids = precomputed_inputs
+            dev = get_layer_device(model, target_layer_idx)
+        else:
+            print('Starting ...')
+            dev, inps, outs, attention_mask, position_ids = get_layer_inputs(
+                model, tokenizer, args, device, target_layer_idx
+            )
+            print('Ready.')
 
         layer = model.model.layers[target_layer_idx]
         subset = find_layers(layer)
         gpts = {name: SparseGPT(subset[name]) for name in subset}
+        attention_mask_dev = maybe_move_tensor(attention_mask, dev)
+        position_ids_dev = maybe_move_tensor(position_ids, dev)
 
         def add_batch(name):
             def tmp(_, inp, out):
@@ -310,11 +480,13 @@ def prune_single_layer_sparsegpt(model, tokenizer, args, device, target_layer_id
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+            inp_j = inps[j].unsqueeze(0).to(dev)
+            out_j = layer(
+                inp_j,
+                attention_mask=attention_mask_dev,
+                position_ids=position_ids_dev,
             )[0]
+            outs[j] = out_j.squeeze(0).to('cpu')
 
         for h in handles:
             h.remove()
@@ -362,31 +534,44 @@ def target_layer_sparsity(model, target_layer_idx):
     return count / total
 
 
-def run_one_layer(args, layer_idx, prune_n, prune_m):
+def run_one_layer(args, model, tokenizer, device, layer_idx, prune_n, prune_m, calib_cache_dir):
+    """Prune a single layer, eval PPL, then restore original weights.
+
+    The model and tokenizer are shared across all layer iterations (Strategy 2).
+    Calibration inputs are loaded from the pre-built cache (Strategy 1).
+    """
     print('=' * 80)
     print(f'Running layer sensitivity for layer {layer_idx}')
-    model = get_llm(args.model, args.cache_dir)
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-    device = get_main_device(model, args.model)
     print('use device ', device)
+
+    # Snapshot weights before pruning so we can restore after eval.
+    snapshot = snapshot_layer_weights(model, layer_idx)
+    # Load pre-computed calibration inputs — no re-propagation needed.
+    precomputed = load_layer_inputs(calib_cache_dir, layer_idx)
 
     start = time.time()
     if args.prune_method == 'magnitude':
         prune_single_layer_magnitude(model, layer_idx, args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m)
     elif args.prune_method == 'wanda':
-        prune_single_layer_wanda(model, tokenizer, args, device, layer_idx, prune_n=prune_n, prune_m=prune_m)
+        prune_single_layer_wanda(model, tokenizer, args, device, layer_idx,
+                                 prune_n=prune_n, prune_m=prune_m,
+                                 precomputed_inputs=precomputed)
     elif args.prune_method == 'sparsegpt':
-        prune_single_layer_sparsegpt(model, tokenizer, args, device, layer_idx, prune_n=prune_n, prune_m=prune_m)
+        prune_single_layer_sparsegpt(model, tokenizer, args, device, layer_idx,
+                                     prune_n=prune_n, prune_m=prune_m,
+                                     precomputed_inputs=precomputed)
     else:
         raise ValueError(f'Unsupported prune_method: {args.prune_method}')
     prune_time_s = time.time() - start
 
     sparsity = target_layer_sparsity(model, layer_idx)
     ppl = eval_ppl(args, model, tokenizer, device)
-    del tokenizer
-    del model
+
+    # Restore the layer to its original (dense) state before the next iteration.
+    restore_layer_weights(model, layer_idx, snapshot)
+    del snapshot, precomputed
     torch.cuda.empty_cache()
+
     return {
         'layer': layer_idx,
         'target_layer_sparsity': sparsity,
@@ -429,25 +614,43 @@ def main():
     torch.random.manual_seed(args.seed)
     prune_n, prune_m = resolve_nm(args)
 
-    probe_model = get_llm(args.model, args.cache_dir)
-    num_layers = len(probe_model.model.layers)
-    del probe_model
-    torch.cuda.empty_cache()
+    # Strategy 2: load model and tokenizer once for the entire run.
+    # Per-layer isolation is achieved via snapshot/restore rather than reload.
+    model = get_llm(args.model, args.cache_dir)
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    device = get_main_device(model, args.model)
+    print('use device ', device)
 
+    num_layers = len(model.model.layers)
     target_layers = parse_layers_arg(args.layers, num_layers)
     os.makedirs(args.save, exist_ok=True)
 
     csv_name = f'layer_sensitivity_{args.prune_method}_{args.sparsity_type.replace(":", "-")}.csv'
     csv_path = os.path.join(args.save, csv_name)
 
+    # Strategy 1: build calibration input cache with one O(N) forward sweep.
+    # Cache is keyed by nsamples+seed so changed hyperparameters get a fresh cache.
+    calib_cache_dir = os.path.join(
+        args.save, f'calib_cache_nsamples{args.nsamples}_seed{args.seed}'
+    )
+    if not _calib_cache_complete(calib_cache_dir, num_layers):
+        print('Building calibration input cache (one-time O(N) pass)...')
+        build_layer_input_cache(model, tokenizer, args, device, calib_cache_dir)
+        print('Calibration cache built.')
+    else:
+        print(f'Reusing existing calibration cache: {calib_cache_dir}')
+
     baseline_ppl = None
     if not args.skip_baseline:
-        baseline_ppl = run_baseline(args)
+        print('=' * 80)
+        print('Running dense baseline')
+        baseline_ppl = float(eval_ppl(args, model, tokenizer, device))
         print(f'dense baseline ppl {baseline_ppl}')
 
     results = []
     for layer_idx in target_layers:
-        row = run_one_layer(args, layer_idx, prune_n, prune_m)
+        row = run_one_layer(args, model, tokenizer, device, layer_idx, prune_n, prune_m, calib_cache_dir)
         row['baseline_ppl'] = baseline_ppl if baseline_ppl is not None else ''
         row['delta_ppl'] = '' if baseline_ppl is None else row['ppl'] - baseline_ppl
         row['prune_method'] = args.prune_method
@@ -459,6 +662,9 @@ def main():
         # checkpoint partial progress after every completed layer
         write_results_csv(csv_path, results)
 
+    del tokenizer
+    del model
+    torch.cuda.empty_cache()
     print('=' * 80)
     print(f'Saved results to {csv_path}')
 

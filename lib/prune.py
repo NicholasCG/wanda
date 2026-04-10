@@ -8,6 +8,31 @@ from .data import get_loaders
 
 from .ablate import AblateGPT 
 
+
+def _synchronize_if_cuda(device):
+    if not torch.cuda.is_available():
+        return
+
+    if isinstance(device, int):
+        torch.cuda.synchronize(device)
+        return
+
+    if isinstance(device, torch.device):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return
+
+    if isinstance(device, str) and device.startswith("cuda"):
+        torch.cuda.synchronize(device)
+
+
+def _time_prune_block(prune_fn, device):
+    _synchronize_if_cuda(device)
+    start = time.perf_counter()
+    prune_fn()
+    _synchronize_if_cuda(device)
+    return time.perf_counter() - start
+
 def find_layers(module, layers=[nn.Linear], name=''):
     """
     Recursively find the layers of a certain type in a module.
@@ -109,21 +134,27 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
+        layer_prune_time_s = 0.0
 
         for name in subset:
-            W = subset[name].weight.data 
-            W_metric = torch.abs(W)
-            if prune_n != 0:
-                W_mask = (torch.zeros_like(W)==1)
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-            else:
-                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
-                W_mask = (W_metric<=thresh)
+            def _prune_single_weight_matrix():
+                W = subset[name].weight.data
+                W_metric = torch.abs(W)
+                if prune_n != 0:
+                    W_mask = (torch.zeros_like(W) == 1)
+                    for ii in range(W_metric.shape[1]):
+                        if ii % prune_m == 0:
+                            tmp = W_metric[:, ii:(ii + prune_m)].float()
+                            W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+                else:
+                    thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel() * args.sparsity_ratio)].cpu()
+                    W_mask = (W_metric <= thresh)
 
-            W[W_mask] = 0
+                W[W_mask] = 0
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, subset[name].weight.device)
+
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
@@ -170,50 +201,56 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         for h in handles:
             h.remove()
 
+        layer_prune_time_s = 0.0
         for name in subset:
             print(f"pruning layer {i} name {name}")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            def _prune_single_weight_matrix():
+                W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-            if prune_n != 0:
-                # structured n:m sparsity
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-            else:
-                if args.use_variant:
-                    sort_res = torch.sort(W_metric, dim=-1, stable=True)
-
-                    # wanda variant 
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
-
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-
-                        alpha = alpha_new 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
+                W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+                if prune_n != 0:
+                    # structured n:m sparsity
+                    for ii in range(W_metric.shape[1]):
+                        if ii % prune_m == 0:
+                            tmp = W_metric[:, ii:(ii + prune_m)].float()
+                            W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
                 else:
-                    # Use top-k smallest selection instead of full sort to reduce peak memory.
-                    indices = torch.topk(
-                        W_metric,
-                        int(W_metric.shape[1] * args.sparsity_ratio),
-                        dim=1,
-                        largest=False,
-                    )[1]
-                    W_mask.scatter_(1, indices, True)
+                    if args.use_variant:
+                        sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+                        # wanda variant
+                        tmp_metric = torch.cumsum(sort_res[0], dim=1)
+                        sum_before = W_metric.sum(dim=1)
+
+                        alpha = 0.4
+                        alpha_hist = [0., 0.8]
+                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
+                        while (torch.abs(cur_sparsity - args.sparsity_ratio) > 0.001) and (alpha_hist[1] - alpha_hist[0] >= 0.001):
+                            if cur_sparsity > args.sparsity_ratio:
+                                alpha_new = (alpha + alpha_hist[0]) / 2.0
+                                alpha_hist[1] = alpha
+                            else:
+                                alpha_new = (alpha + alpha_hist[1]) / 2.0
+                                alpha_hist[0] = alpha
+
+                            alpha = alpha_new
+                            W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
+                        print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
+                    else:
+                        # Use top-k smallest selection instead of full sort to reduce peak memory.
+                        indices = torch.topk(
+                            W_metric,
+                            int(W_metric.shape[1] * args.sparsity_ratio),
+                            dim=1,
+                            largest=False,
+                        )[1]
+                        W_mask.scatter_(1, indices, True)
+
+                subset[name].weight.data[W_mask] = 0  ## set weights to zero
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, dev)
+
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
 
         for j in range(args.nsamples):
             with torch.no_grad():
@@ -302,12 +339,24 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         for h in handles:
             h.remove()
 
+        layer_prune_time_s = 0.0
         for name in gpts:
             print(i, name)
             # print('Pruning ...')
 
-            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+            def _prune_single_weight_matrix():
+                gpts[name].fasterprune(
+                    args.sparsity_ratio,
+                    prune_n=prune_n,
+                    prune_m=prune_m,
+                    percdamp=0.01,
+                    blocksize=128,
+                )
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, dev)
             gpts[name].free()
+
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
 
         for j in range(args.nsamples):
             inp_j = inps[j].unsqueeze(0).to(dev)
@@ -395,19 +444,33 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         for h in handles:
             h.remove()
 
+        layer_prune_time_s = 0.0
         for name in gpts:
             print(i, name)
             print('Pruning ...')
 
-            if args.prune_method == "ablate_wanda_seq":
-                prune_mask = gpts[name].get_wanda_mask(args.sparsity_ratio, prune_n, prune_m)
-            elif args.prune_method == "ablate_mag_seq":
-                prune_mask = gpts[name].get_mag_mask(args.sparsity_ratio, prune_n, prune_m)
-            elif "iter" in args.prune_method:
-                prune_mask = None 
+            def _prune_single_weight_matrix():
+                if args.prune_method == "ablate_wanda_seq":
+                    prune_mask = gpts[name].get_wanda_mask(args.sparsity_ratio, prune_n, prune_m)
+                elif args.prune_method == "ablate_mag_seq":
+                    prune_mask = gpts[name].get_mag_mask(args.sparsity_ratio, prune_n, prune_m)
+                elif "iter" in args.prune_method:
+                    prune_mask = None
 
-            gpts[name].fasterprune(args, args.sparsity_ratio, mask=prune_mask, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+                gpts[name].fasterprune(
+                    args,
+                    args.sparsity_ratio,
+                    mask=prune_mask,
+                    prune_n=prune_n,
+                    prune_m=prune_m,
+                    percdamp=0.01,
+                    blocksize=128,
+                )
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, dev)
             gpts[name].free()
+
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
