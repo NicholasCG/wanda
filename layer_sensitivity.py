@@ -22,9 +22,9 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 
+# Eugenio Diaz: created this script to perform per-layer sensitivity analysis by pruning each layer individually and recording the PPL impact.
 def get_llm(model_name, cache_dir='llm_weights'):
-    # Reserve 2 GiB headroom on the GPU to prevent accelerate from disk-offloading
-    # layers when allocator fragmentation builds up across repeated model loads.
+    # Nicholas Gray: reserves 2 GiB GPU headroom to prevent accelerate from disk-offloading layers during repeated model loads.
     n_gpus = torch.cuda.device_count()
     if n_gpus > 0:
         total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
@@ -140,7 +140,7 @@ def get_layer_inputs(model, tokenizer, args, device, target_layer_idx):
                     model, dataloader, device
                 )
 
-        # Keep full activation buffers on CPU and stream per-sample to GPU.
+        # Nicholas Gray: keeps activation buffers on CPU and streams per-sample to GPU to reduce VRAM usage during calibration propagation.
         inps = inps.to('cpu')
         outs = outs.to('cpu')
         attention_mask = maybe_move_tensor(attention_mask, 'cpu')
@@ -176,6 +176,7 @@ def get_layer_inputs(model, tokenizer, args, device, target_layer_idx):
 # Strategy 1: one-time calibration cache
 # ---------------------------------------------------------------------------
 
+# Nicholas Gray: one-time calibration input cache that replaces O(i) re-propagation with a single O(N) sweep, eliminating quadratic layer-scan time.
 def _calib_cache_complete(cache_dir, num_layers):
     """Return True only if every per-layer input file and the meta file exist."""
     if not os.path.isdir(cache_dir):
@@ -267,6 +268,7 @@ def load_layer_inputs(cache_dir, layer_idx):
 # Strategy 2: per-layer weight snapshot / restore
 # ---------------------------------------------------------------------------
 
+# Nicholas Gray: snapshot/restore strategy lets all layers share one loaded model, avoiding a costly reload between each layer evaluation.
 def snapshot_layer_weights(model, layer_idx):
     """Clone every parameter in the target transformer block."""
     layer = model.model.layers[layer_idx]

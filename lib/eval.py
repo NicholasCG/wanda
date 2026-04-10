@@ -11,6 +11,7 @@ from collections import defaultdict
 import fnmatch
 
 
+# Nicholas Gray: resolves the embedding device for multi-GPU models to avoid cross-device tensor errors.
 def _resolve_eval_device(model, device):
     if hasattr(model, "hf_device_map") and "model.embed_tokens" in model.hf_device_map:
         return model.hf_device_map["model.embed_tokens"]
@@ -32,7 +33,7 @@ def eval_ppl(args, model, tokenizer, device=torch.device("cuda:0")):
 
     device = _resolve_eval_device(model, device)
 
-    # Disable KV cache during perplexity eval to reduce activation memory.
+    # Nicholas Gray: disables KV cache and uses inference_mode to reduce activation memory during evaluation.
     use_cache = model.config.use_cache
     model.config.use_cache = False
     with torch.inference_mode():
@@ -49,6 +50,7 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
     # nsamples = testenc.numel() // model.seqlen
     nsamples = len(trainloader)
 
+    # Nicholas Gray: accumulates NLL as a running scalar and uses the model's built-in loss to avoid materializing logit tensors.
     total_nll = 0.0
     print(f"nsamples {nsamples}")
 
@@ -93,6 +95,7 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
     # Calculate number of samples
     nsamples = testenc.numel() // model.seqlen
 
+    # Nicholas Gray: accumulates NLL as a running scalar and uses the model's built-in loss to avoid materializing logit tensors.
     total_nll = 0.0
     print(f"nsamples {nsamples}")
 

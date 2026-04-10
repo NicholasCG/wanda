@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Set common variables
+# Nicholas Gray: updated model reference from decapoda-research/llama-7b-hf and restructured runs to cover all methods with a dense baseline.
 model="huggyllama/llama-7b"
 sparsity_ratio=0.5
 cuda_device=0

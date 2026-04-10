@@ -9,6 +9,7 @@ from .data import get_loaders
 from .ablate import AblateGPT 
 
 
+# Nicholas Gray: CUDA-synchronized timing helpers for per-layer pruning wall-clock measurement.
 def _synchronize_if_cuda(device):
     if not torch.cuda.is_available():
         return
@@ -90,7 +91,7 @@ def prepare_calibration_input(model, dataloader, device, nsamples):
         device = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    # Store calibration activations on CPU to avoid reserving large GPU buffers.
+    # Nicholas Gray: stores calibration activations on CPU to avoid reserving large GPU buffers.
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype)
     inps.requires_grad = False
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
@@ -154,6 +155,7 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
             layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, subset[name].weight.device)
 
+        # Nicholas Gray: logs per-layer wall-clock pruning time for performance profiling.
         print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
@@ -195,6 +197,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
             with torch.no_grad():
+                # Nicholas Gray: streams one sample at a time to the active device to avoid holding all activations on GPU.
                 inp_j = inps[j].unsqueeze(0).to(dev)
                 out_j = layer(inp_j, attention_mask=attention_mask_dev, position_ids=position_ids_dev)[0]
                 outs[j] = out_j.squeeze(0).to("cpu")
@@ -237,7 +240,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                             W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
                         print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
                     else:
-                        # Use top-k smallest selection instead of full sort to reduce peak memory.
+                        # Nicholas Gray: uses top-k instead of full sort to reduce peak memory for unstructured pruning.
                         indices = torch.topk(
                             W_metric,
                             int(W_metric.shape[1] * args.sparsity_ratio),
@@ -277,7 +280,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         dev = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    # Store calibration activations on CPU and stream one sample at a time to reduce VRAM.
+    # Nicholas Gray: stores calibration activations on CPU and streams one sample at a time to reduce VRAM.
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype
     )

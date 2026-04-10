@@ -9,6 +9,7 @@ import gc
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 from lib.eval import eval_ppl, eval_zero_shot
+# Nicholas Gray: imports verbatim upstream implementations to serve as a correctness baseline for comparison mode.
 from lib.prune_original import (
     prune_wanda as prune_wanda_original,
     prune_magnitude as prune_magnitude_original,
@@ -36,6 +37,7 @@ def get_llm(model_name, cache_dir="llm_weights"):
     return model
 
 
+# Nicholas Gray: extracted device selection to a shared helper used by both normal and comparison-mode runs.
 def get_processing_device(model, model_name):
     device = torch.device("cuda:0")
     if "30b" in model_name or "65b" in model_name:
@@ -43,6 +45,7 @@ def get_processing_device(model, model_name):
     return device
 
 
+# Nicholas Gray: unified dispatcher that routes to either the original or modified pruning implementation.
 def run_pruning(args, model, tokenizer, device, prune_n, prune_m, use_original=False):
     if args.sparsity_ratio == 0:
         return
@@ -68,6 +71,7 @@ def run_pruning(args, model, tokenizer, device, prune_n, prune_m, use_original=F
         prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
 
+# Nicholas Gray: captures pruned weights on CPU so the original model can be freed before loading the modified one.
 def snapshot_pruned_weights_cpu(model):
     snapshot = {}
     layers = model.model.layers
@@ -78,6 +82,7 @@ def snapshot_pruned_weights_cpu(model):
     return snapshot
 
 
+# Nicholas Gray: compares original and modified pruned weight masks to verify numerical equivalence after memory optimizations.
 def compare_pruned_models(original_snapshot_cpu, model_modified, sample_limit=5):
     diff_entries = []
     total_mask_diffs = 0
@@ -162,6 +167,7 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
+    # Nicholas Gray: added flags to run both implementations back-to-back and diff their pruned weights and PPL.
     parser.add_argument(
         "--compare_original_modified",
         action="store_true",
@@ -188,6 +194,7 @@ def main():
     model_name = args.model.split("/")[-1]
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
+    # Nicholas Gray: comparison mode runs both implementations sequentially and writes a JSON diff report of sparsity and PPL deltas.
     if args.compare_original_modified:
         print("comparison mode: running original implementation")
         np.random.seed(args.seed)
