@@ -40,6 +40,8 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
+    parser.add_argument("--zero_shot_batch_size", type=int, default=None,
+                        help="Batch size for zero-shot evaluation. Defaults to auto-detect.")
     args = parser.parse_args()
 
     # Setting seeds for reproducibility
@@ -97,7 +99,8 @@ def main():
 
         task_list = ["boolq", "rte","hellaswag","winogrande", "arc_easy","arc_challenge", "openbookqa"]
         num_shot = 0
-        results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
+        zs_batch = args.zero_shot_batch_size if args.zero_shot_batch_size is not None else "auto"
+        results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate, batch_size=zs_batch)
         print("********************************")
         print("zero_shot evaluation results")
         print(results)

@@ -48,6 +48,10 @@ RUN conda run -n "${ENV_NAME}" pip install --no-cache-dir \
     wandb \
     sentencepiece \
     accelerate==0.18.0
+# lm_eval 0.4.x supersedes the custom lm-evaluation-harness fork and supports
+# injecting a pre-loaded model/tokenizer directly via HFLM (used by --eval_zero_shot).
+# It requires accelerate>=0.21.0, so we install it last to let pip resolve the upgrade.
+RUN conda run -n "${ENV_NAME}" pip install --no-cache-dir "lm_eval==0.4.2" "peft==0.7.1"
 
 # Put the project on PYTHONPATH and make the conda env the default Python.
 ENV PATH=/opt/conda/envs/${ENV_NAME}/bin:$PATH

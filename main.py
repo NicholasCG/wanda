@@ -167,6 +167,8 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
+    parser.add_argument("--zero_shot_batch_size", type=int, default=None,
+                        help="Batch size for zero-shot evaluation. Defaults to auto-detect.")
     # Nicholas Gray: added flags to run both implementations back-to-back and diff their pruned weights and PPL.
     parser.add_argument(
         "--compare_original_modified",
@@ -337,10 +339,15 @@ def main():
 
         task_list = ["boolq", "rte","hellaswag","winogrande", "arc_easy","arc_challenge", "openbookqa"]
         num_shot = 0
-        results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
+        zs_batch = args.zero_shot_batch_size if args.zero_shot_batch_size is not None else "auto"
+        results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate, batch_size=zs_batch)
         print("********************************")
         print("zero_shot evaluation results")
-        print(results)
+        # Pretty print JSON results
+        print(json.dumps(results['results'], indent=2))
+        json.dump(results, open(os.path.join(args.save, f"zero_shot_{args.prune_method}.json"), "w"), indent=2)
+        json.dump(results['results'], open(os.path.join(args.save, f"zero_shot_{args.prune_method}_results.json"), "w"), indent=2)
+        print("********************************")
 
     if args.save_model:
         model.save_pretrained(args.save_model)
