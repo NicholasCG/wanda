@@ -53,6 +53,12 @@ RUN conda run -n "${ENV_NAME}" pip install --no-cache-dir \
 # It requires accelerate>=0.21.0, so we install it last to let pip resolve the upgrade.
 RUN conda run -n "${ENV_NAME}" pip install --no-cache-dir "lm_eval==0.4.2" "peft==0.7.1"
 
+# bitsandbytes: 0.43.3 ships prebuilt binaries for both CUDA 11.x
+# (libbitsandbytes_cuda113.so) and CUDA 12.x (libbitsandbytes_cuda12x.so),
+# covering the CUDA 11.3 stack in this container as well as newer host
+# environments (CUDA 12.x). It remains compatible with PyTorch 1.10.1+.
+RUN conda run -n "${ENV_NAME}" pip install --no-cache-dir "bitsandbytes==0.48.2"
+
 # Put the project on PYTHONPATH and make the conda env the default Python.
 ENV PATH=/opt/conda/envs/${ENV_NAME}/bin:$PATH
 ENV PYTHONPATH=/workspace

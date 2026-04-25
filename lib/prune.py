@@ -130,7 +130,8 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     return W_mask, cur_sparsity
 
 def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    layers = model.model.layers 
+    layers = model.model.layers
+    total_prune_time_s = 0.0
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -157,6 +158,10 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
 
         # Nicholas Gray: logs per-layer wall-clock pruning time for performance profiling.
         print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
+
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
+    return total_prune_time_s
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
@@ -171,6 +176,12 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         )
 
     layers = model.model.layers
+    skip_last_n = getattr(args, 'skip_last_n_layers', 0)
+    skip_set = set(getattr(args, 'skip_layers', None) or [])
+    if skip_last_n > 0:
+        skip_set |= set(range(len(layers) - skip_last_n, len(layers)))
+    total_prune_time_s = 0.0
+
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -203,6 +214,11 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 outs[j] = out_j.squeeze(0).to("cpu")
         for h in handles:
             h.remove()
+
+        if i in skip_set:
+            print(f"layer {i} skipped (preserved: dense)")
+            inps, outs = outs, inps
+            continue
 
         layer_prune_time_s = 0.0
         for name in subset:
@@ -254,6 +270,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, dev)
 
         print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
 
         for j in range(args.nsamples):
             with torch.no_grad():
@@ -262,8 +279,10 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 outs[j] = out_j.squeeze(0).to("cpu")
         inps, outs = outs, inps
 
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
+    return total_prune_time_s
 
 
 @torch.no_grad()
@@ -310,6 +329,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     position_ids = cache['position_ids']
 
     print('Ready.')
+    total_prune_time_s = 0.0
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -360,6 +380,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             gpts[name].free()
 
         print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
 
         for j in range(args.nsamples):
             inp_j = inps[j].unsqueeze(0).to(dev)
@@ -371,8 +392,10 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
         inps, outs = outs, inps
 
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+    return total_prune_time_s
 
 
 
@@ -419,6 +442,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     position_ids = cache['position_ids']
 
     print('Ready.')
+    total_prune_time_s = 0.0
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -474,6 +498,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             gpts[name].free()
 
         print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
@@ -483,5 +508,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
         inps, outs = outs, inps
 
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+    return total_prune_time_s
