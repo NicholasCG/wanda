@@ -9,6 +9,7 @@ import gc
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 from lib.eval import eval_ppl, eval_zero_shot
+# Nicholas Gray: imports verbatim upstream implementations to serve as a correctness baseline for comparison mode.
 from lib.prune_original import (
     prune_wanda as prune_wanda_original,
     prune_magnitude as prune_magnitude_original,
@@ -36,6 +37,7 @@ def get_llm(model_name, cache_dir="llm_weights"):
     return model
 
 
+# Nicholas Gray: extracted device selection to a shared helper used by both normal and comparison-mode runs.
 def get_processing_device(model, model_name):
     device = torch.device("cuda:0")
     if "30b" in model_name or "65b" in model_name:
@@ -43,6 +45,7 @@ def get_processing_device(model, model_name):
     return device
 
 
+# Nicholas Gray: unified dispatcher that routes to either the original or modified pruning implementation.
 def run_pruning(args, model, tokenizer, device, prune_n, prune_m, use_original=False):
     if args.sparsity_ratio == 0:
         return
@@ -68,6 +71,7 @@ def run_pruning(args, model, tokenizer, device, prune_n, prune_m, use_original=F
         prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
 
+# Nicholas Gray: captures pruned weights on CPU so the original model can be freed before loading the modified one.
 def snapshot_pruned_weights_cpu(model):
     snapshot = {}
     layers = model.model.layers
@@ -78,6 +82,7 @@ def snapshot_pruned_weights_cpu(model):
     return snapshot
 
 
+# Nicholas Gray: compares original and modified pruned weight masks to verify numerical equivalence after memory optimizations.
 def compare_pruned_models(original_snapshot_cpu, model_modified, sample_limit=5):
     diff_entries = []
     total_mask_diffs = 0
@@ -161,7 +166,14 @@ def main():
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 
+    parser.add_argument('--skip_last_n_layers', type=int, default=0,
+                        help='Number of final transformer layers to leave unpruned (Wanda only).')
+    parser.add_argument('--skip_layers', type=int, nargs='*', default=[],
+                        help='Explicit list of layer indices to leave unpruned (Wanda only).')
     parser.add_argument("--eval_zero_shot", action="store_true")
+    parser.add_argument("--zero_shot_batch_size", type=int, default=None,
+                        help="Batch size for zero-shot evaluation. Defaults to auto-detect.")
+    # Nicholas Gray: added flags to run both implementations back-to-back and diff their pruned weights and PPL.
     parser.add_argument(
         "--compare_original_modified",
         action="store_true",
@@ -188,6 +200,7 @@ def main():
     model_name = args.model.split("/")[-1]
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
+    # Nicholas Gray: comparison mode runs both implementations sequentially and writes a JSON diff report of sparsity and PPL deltas.
     if args.compare_original_modified:
         print("comparison mode: running original implementation")
         np.random.seed(args.seed)
@@ -296,16 +309,17 @@ def main():
     device = get_processing_device(model, args.model)
     print("use device ", device)
 
+    total_prune_time_s = 0.0
     if args.sparsity_ratio != 0:
         print("pruning starts")
         if args.prune_method == "wanda":
-            prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            total_prune_time_s = prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "magnitude":
-            prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            total_prune_time_s = prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "sparsegpt":
-            prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            total_prune_time_s = prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif "ablate" in args.prune_method:
-            prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            total_prune_time_s = prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
     ################################################################
     print("*"*30)
@@ -315,13 +329,14 @@ def main():
     ################################################################
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")
+    print(f"total pruning time {total_prune_time_s:.6f} s")
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
     save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
     with open(save_filepath, "w") as f:
-        print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+        print("method\tactual_sparsity\tppl_test\ttotal_prune_time_s", file=f, flush=True)
+        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}\t{total_prune_time_s:.6f}", file=f, flush=True)
 
     if args.eval_zero_shot:
         accelerate=False
@@ -330,10 +345,15 @@ def main():
 
         task_list = ["boolq", "rte","hellaswag","winogrande", "arc_easy","arc_challenge", "openbookqa"]
         num_shot = 0
-        results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
+        zs_batch = args.zero_shot_batch_size if args.zero_shot_batch_size is not None else "auto"
+        results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate, batch_size=zs_batch)
         print("********************************")
         print("zero_shot evaluation results")
-        print(results)
+        # Pretty print JSON results
+        print(json.dumps(results['results'], indent=2))
+        json.dump(results, open(os.path.join(args.save, f"zero_shot_{args.prune_method}.json"), "w"), indent=2)
+        json.dump(results['results'], open(os.path.join(args.save, f"zero_shot_{args.prune_method}_results.json"), "w"), indent=2)
+        print("********************************")
 
     if args.save_model:
         model.save_pretrained(args.save_model)

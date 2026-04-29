@@ -8,6 +8,32 @@ from .data import get_loaders
 
 from .ablate import AblateGPT 
 
+
+# Nicholas Gray: CUDA-synchronized timing helpers for per-layer pruning wall-clock measurement.
+def _synchronize_if_cuda(device):
+    if not torch.cuda.is_available():
+        return
+
+    if isinstance(device, int):
+        torch.cuda.synchronize(device)
+        return
+
+    if isinstance(device, torch.device):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return
+
+    if isinstance(device, str) and device.startswith("cuda"):
+        torch.cuda.synchronize(device)
+
+
+def _time_prune_block(prune_fn, device):
+    _synchronize_if_cuda(device)
+    start = time.perf_counter()
+    prune_fn()
+    _synchronize_if_cuda(device)
+    return time.perf_counter() - start
+
 def find_layers(module, layers=[nn.Linear], name=''):
     """
     Recursively find the layers of a certain type in a module.
@@ -65,7 +91,7 @@ def prepare_calibration_input(model, dataloader, device, nsamples):
         device = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    # Store calibration activations on CPU to avoid reserving large GPU buffers.
+    # Nicholas Gray: stores calibration activations on CPU to avoid reserving large GPU buffers.
     inps = torch.zeros((nsamples, model.seqlen, model.config.hidden_size), dtype=dtype)
     inps.requires_grad = False
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
@@ -104,26 +130,38 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     return W_mask, cur_sparsity
 
 def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    layers = model.model.layers 
+    layers = model.model.layers
+    total_prune_time_s = 0.0
 
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
+        layer_prune_time_s = 0.0
 
         for name in subset:
-            W = subset[name].weight.data 
-            W_metric = torch.abs(W)
-            if prune_n != 0:
-                W_mask = (torch.zeros_like(W)==1)
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-            else:
-                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
-                W_mask = (W_metric<=thresh)
+            def _prune_single_weight_matrix():
+                W = subset[name].weight.data
+                W_metric = torch.abs(W)
+                if prune_n != 0:
+                    W_mask = (torch.zeros_like(W) == 1)
+                    for ii in range(W_metric.shape[1]):
+                        if ii % prune_m == 0:
+                            tmp = W_metric[:, ii:(ii + prune_m)].float()
+                            W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+                else:
+                    thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel() * args.sparsity_ratio)].cpu()
+                    W_mask = (W_metric <= thresh)
 
-            W[W_mask] = 0
+                W[W_mask] = 0
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, subset[name].weight.device)
+
+        # Nicholas Gray: logs per-layer wall-clock pruning time for performance profiling.
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
+
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
+    return total_prune_time_s
 
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
@@ -138,6 +176,12 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         )
 
     layers = model.model.layers
+    skip_last_n = getattr(args, 'skip_last_n_layers', 0)
+    skip_set = set(getattr(args, 'skip_layers', None) or [])
+    if skip_last_n > 0:
+        skip_set |= set(range(len(layers) - skip_last_n, len(layers)))
+    total_prune_time_s = 0.0
+
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
@@ -164,56 +208,69 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
             with torch.no_grad():
+                # Nicholas Gray: streams one sample at a time to the active device to avoid holding all activations on GPU.
                 inp_j = inps[j].unsqueeze(0).to(dev)
                 out_j = layer(inp_j, attention_mask=attention_mask_dev, position_ids=position_ids_dev)[0]
                 outs[j] = out_j.squeeze(0).to("cpu")
         for h in handles:
             h.remove()
 
+        if i in skip_set:
+            print(f"layer {i} skipped (preserved: dense)")
+            inps, outs = outs, inps
+            continue
+
+        layer_prune_time_s = 0.0
         for name in subset:
             print(f"pruning layer {i} name {name}")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            def _prune_single_weight_matrix():
+                W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-            if prune_n != 0:
-                # structured n:m sparsity
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-            else:
-                if args.use_variant:
-                    sort_res = torch.sort(W_metric, dim=-1, stable=True)
-
-                    # wanda variant 
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
-
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity_ratio)>0.001) and (alpha_hist[1]-alpha_hist[0]>=0.001):
-                        if cur_sparsity > args.sparsity_ratio:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-
-                        alpha = alpha_new 
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
+                W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+                if prune_n != 0:
+                    # structured n:m sparsity
+                    for ii in range(W_metric.shape[1]):
+                        if ii % prune_m == 0:
+                            tmp = W_metric[:, ii:(ii + prune_m)].float()
+                            W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
                 else:
-                    # Use top-k smallest selection instead of full sort to reduce peak memory.
-                    indices = torch.topk(
-                        W_metric,
-                        int(W_metric.shape[1] * args.sparsity_ratio),
-                        dim=1,
-                        largest=False,
-                    )[1]
-                    W_mask.scatter_(1, indices, True)
+                    if args.use_variant:
+                        sort_res = torch.sort(W_metric, dim=-1, stable=True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+                        # wanda variant
+                        tmp_metric = torch.cumsum(sort_res[0], dim=1)
+                        sum_before = W_metric.sum(dim=1)
+
+                        alpha = 0.4
+                        alpha_hist = [0., 0.8]
+                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
+                        while (torch.abs(cur_sparsity - args.sparsity_ratio) > 0.001) and (alpha_hist[1] - alpha_hist[0] >= 0.001):
+                            if cur_sparsity > args.sparsity_ratio:
+                                alpha_new = (alpha + alpha_hist[0]) / 2.0
+                                alpha_hist[1] = alpha
+                            else:
+                                alpha_new = (alpha + alpha_hist[1]) / 2.0
+                                alpha_hist[0] = alpha
+
+                            alpha = alpha_new
+                            W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
+                        print(f"alpha found {alpha} sparsity {cur_sparsity:.6f}")
+                    else:
+                        # Nicholas Gray: uses top-k instead of full sort to reduce peak memory for unstructured pruning.
+                        indices = torch.topk(
+                            W_metric,
+                            int(W_metric.shape[1] * args.sparsity_ratio),
+                            dim=1,
+                            largest=False,
+                        )[1]
+                        W_mask.scatter_(1, indices, True)
+
+                subset[name].weight.data[W_mask] = 0  ## set weights to zero
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, dev)
+
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
 
         for j in range(args.nsamples):
             with torch.no_grad():
@@ -222,8 +279,10 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 outs[j] = out_j.squeeze(0).to("cpu")
         inps, outs = outs, inps
 
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
+    return total_prune_time_s
 
 
 @torch.no_grad()
@@ -240,7 +299,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         dev = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    # Store calibration activations on CPU and stream one sample at a time to reduce VRAM.
+    # Nicholas Gray: stores calibration activations on CPU and streams one sample at a time to reduce VRAM.
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype
     )
@@ -270,6 +329,7 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     position_ids = cache['position_ids']
 
     print('Ready.')
+    total_prune_time_s = 0.0
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -302,12 +362,25 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         for h in handles:
             h.remove()
 
+        layer_prune_time_s = 0.0
         for name in gpts:
             print(i, name)
             # print('Pruning ...')
 
-            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+            def _prune_single_weight_matrix():
+                gpts[name].fasterprune(
+                    args.sparsity_ratio,
+                    prune_n=prune_n,
+                    prune_m=prune_m,
+                    percdamp=0.01,
+                    blocksize=128,
+                )
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, dev)
             gpts[name].free()
+
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
 
         for j in range(args.nsamples):
             inp_j = inps[j].unsqueeze(0).to(dev)
@@ -319,8 +392,10 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
         inps, outs = outs, inps
 
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+    return total_prune_time_s
 
 
 
@@ -367,6 +442,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     position_ids = cache['position_ids']
 
     print('Ready.')
+    total_prune_time_s = 0.0
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -395,19 +471,34 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         for h in handles:
             h.remove()
 
+        layer_prune_time_s = 0.0
         for name in gpts:
             print(i, name)
             print('Pruning ...')
 
-            if args.prune_method == "ablate_wanda_seq":
-                prune_mask = gpts[name].get_wanda_mask(args.sparsity_ratio, prune_n, prune_m)
-            elif args.prune_method == "ablate_mag_seq":
-                prune_mask = gpts[name].get_mag_mask(args.sparsity_ratio, prune_n, prune_m)
-            elif "iter" in args.prune_method:
-                prune_mask = None 
+            def _prune_single_weight_matrix():
+                if args.prune_method == "ablate_wanda_seq":
+                    prune_mask = gpts[name].get_wanda_mask(args.sparsity_ratio, prune_n, prune_m)
+                elif args.prune_method == "ablate_mag_seq":
+                    prune_mask = gpts[name].get_mag_mask(args.sparsity_ratio, prune_n, prune_m)
+                elif "iter" in args.prune_method:
+                    prune_mask = None
 
-            gpts[name].fasterprune(args, args.sparsity_ratio, mask=prune_mask, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+                gpts[name].fasterprune(
+                    args,
+                    args.sparsity_ratio,
+                    mask=prune_mask,
+                    prune_n=prune_n,
+                    prune_m=prune_m,
+                    percdamp=0.01,
+                    blocksize=128,
+                )
+
+            layer_prune_time_s += _time_prune_block(_prune_single_weight_matrix, dev)
             gpts[name].free()
+
+        print(f"layer {i} prune_time_s {layer_prune_time_s:.6f}")
+        total_prune_time_s += layer_prune_time_s
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
@@ -417,5 +508,7 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
 
         inps, outs = outs, inps
 
+    print(f"total prune_time_s {total_prune_time_s:.6f}")
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+    return total_prune_time_s

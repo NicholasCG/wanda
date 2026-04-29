@@ -8,9 +8,10 @@ import torch.nn as nn
 from .data import get_loaders 
 
 from collections import defaultdict
-import fnmatch
 
 
+
+# Nicholas Gray: resolves the embedding device for multi-GPU models to avoid cross-device tensor errors.
 def _resolve_eval_device(model, device):
     if hasattr(model, "hf_device_map") and "model.embed_tokens" in model.hf_device_map:
         return model.hf_device_map["model.embed_tokens"]
@@ -32,7 +33,7 @@ def eval_ppl(args, model, tokenizer, device=torch.device("cuda:0")):
 
     device = _resolve_eval_device(model, device)
 
-    # Disable KV cache during perplexity eval to reduce activation memory.
+    # Nicholas Gray: disables KV cache and uses inference_mode to reduce activation memory during evaluation.
     use_cache = model.config.use_cache
     model.config.use_cache = False
     with torch.inference_mode():
@@ -49,6 +50,7 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
     # nsamples = testenc.numel() // model.seqlen
     nsamples = len(trainloader)
 
+    # Nicholas Gray: accumulates NLL as a running scalar and uses the model's built-in loss to avoid materializing logit tensors.
     total_nll = 0.0
     print(f"nsamples {nsamples}")
 
@@ -93,6 +95,7 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
     # Calculate number of samples
     nsamples = testenc.numel() // model.seqlen
 
+    # Nicholas Gray: accumulates NLL as a running scalar and uses the model's built-in loss to avoid materializing logit tensors.
     total_nll = 0.0
     print(f"nsamples {nsamples}")
 
@@ -129,37 +132,33 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
     return ppl
 
 
-def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hellaswag","winogrande","arc_challenge","arc_easy","openbookqa"], 
-        num_fewshot=0, use_accelerate=False, add_special_tokens=False):
-    from lm_eval import tasks, evaluator 
-    def pattern_match(patterns, source_list):
-        task_names = set()
-        for pattern in patterns:
-            for matching in fnmatch.filter(source_list, pattern):
-                task_names.add(matching)
-        return list(task_names)
-    task_names = pattern_match(task_list, tasks.ALL_TASKS)
-    model_args = f"pretrained={model_name},cache_dir=./llm_weights"
-    limit = None 
+def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hellaswag","winogrande","arc_challenge","arc_easy","openbookqa"],
+        num_fewshot=0, use_accelerate=False, add_special_tokens=False, batch_size="auto"):
+    # Uses lm_eval>=0.4 which natively supports injecting a pre-loaded model via HFLM.
+    # Install with: pip install -r requirements_zero_shot.txt
+    from lm_eval.evaluator import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
+
+    # For very large models evaluated on lm_eval, cap examples to avoid OOM.
+    limit = None
     if "70b" in model_name or "65b" in model_name:
         limit = 2000
-    if use_accelerate:
-        model_args = f"pretrained={model_name},cache_dir=./llm_weights,use_accelerate=True"
-    results = evaluator.simple_evaluate(
-        model="hf-causal-experimental",
-        model_args=model_args,
-        tasks=task_names,
-        num_fewshot=num_fewshot,
-        batch_size=None,
-        device=None,
-        no_cache=True,
-        limit=limit,
-        description_dict={},
-        decontamination_ngrams_path=None,
-        check_integrity=False,
-        pretrained_model=model,
-        tokenizer=tokenizer, 
-        add_special_tokens=add_special_tokens
+
+    # Wrap the already-pruned, already-loaded model so lm_eval does not reload it.
+    # use_accelerate is a no-op here because the model is already placed on devices
+    # via device_map="auto" by get_llm().
+    lm_obj = HFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        add_special_tokens=add_special_tokens,
+        batch_size=batch_size,
     )
 
-    return results 
+    results = simple_evaluate(
+        model=lm_obj,
+        tasks=task_list,
+        num_fewshot=num_fewshot,
+        limit=limit,
+    )
+
+    return results
