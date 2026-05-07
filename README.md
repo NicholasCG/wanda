@@ -26,7 +26,8 @@ Compared to magnitude pruning which removes weights solely based on their magnit
   - [Table of Contents](#table-of-contents)
   - [Setup](#setup)
     - [Recommended: Docker](#recommended-docker)
-    - [Backup: Manual Installation](#backup-manual-installation)
+    - [Backup: requirements.txt](#backup-requirementstxt)
+    - [Secondary Backup: Manual Installation](#secondary-backup-manual-installation)
   - [Model Weights](#model-weights)
   - [Running the Code](#running-the-code)
     - [Command-Line Arguments](#command-line-arguments)
@@ -70,7 +71,35 @@ Inside the container all commands below can be run directly from `/workspace`.
 
 ---
 
-### Backup: Manual Installation
+### Backup: requirements.txt
+
+If Docker is not available, you can reproduce the environment using the provided `requirements.txt`. You will still need conda for the PyTorch + CUDA step.
+
+**1. Create and activate a conda environment:**
+```sh
+conda create -n prune_llm python=3.9 -y
+conda activate prune_llm
+```
+
+**2. Install PyTorch with CUDA 11.3 via conda:**
+```sh
+conda install pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.10.1 cudatoolkit=11.3 \
+    -c pytorch -c conda-forge -y
+```
+
+**3. Install remaining dependencies from `requirements.txt`:**
+```sh
+pip install -r requirements.txt
+```
+
+**4. Set the project root on `PYTHONPATH`:**
+```sh
+export PYTHONPATH=/path/to/wanda
+```
+
+---
+
+### Secondary Backup: Manual Installation
 
 If you prefer to install without Docker, the following steps replicate the environment on a machine with CUDA 11.3:
 
